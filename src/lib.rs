@@ -556,6 +556,53 @@ mod tests {
     }
 
     #[test]
+    fn test_exact_layout_readings_for_azerty() {
+        use crate::detector::AltReadings;
+        let mut engine = Engine::new(None);
+        engine.set_pair_enabled(PairId::RuFr, true);
+        let reading = |pairs: &[(Lang, &str)]| {
+            let mut a = AltReadings::exact();
+            for (l, s) in pairs {
+                a.set(*l, *s);
+            }
+            a
+        };
+
+        // AZERTY accented letters sit on the Russian digit keys: `été` typed on RU is `2е2`.
+        let a = reading(&[(Lang::En, "2t2"), (Lang::Fr, "été")]);
+        let d = engine.evaluate_with_alts("2е2", &a, Lang::Ru, "notepad.exe");
+        assert_eq!(d.action, ActionType::ConvertLayout, "{}", d.reason);
+        assert_eq!((d.target_lang, d.replacement.as_deref()), (Lang::Fr, Some("été")));
+
+        // French elision through the AZERTY `'` (Russian `4`).
+        let a = reading(&[(Lang::En, "c4est"), (Lang::Fr, "c'est")]);
+        let d = engine.evaluate_with_alts("с4уые", &a, Lang::Ru, "notepad.exe");
+        assert_eq!(d.replacement.as_deref(), Some("c'est"), "{}", d.reason);
+
+        // Plain numbers stay numbers even though `2` and `0` are French letters.
+        let a = reading(&[(Lang::En, "2020"), (Lang::Fr, "éàéà")]);
+        let d = engine.evaluate_with_alts("2020", &a, Lang::Ru, "notepad.exe");
+        assert_eq!(d.action, ActionType::None);
+
+        // Russian typed on AZERTY: `х` is the `^` dead key.
+        engine.reset_context();
+        let a = reading(&[(Lang::Ru, "хорошо")]);
+        let d = engine.evaluate_with_alts("^jhjij", &a, Lang::Fr, "notepad.exe");
+        assert_eq!(d.action, ActionType::ConvertLayout, "{}", d.reason);
+        assert_eq!((d.target_lang, d.replacement.as_deref()), (Lang::Ru, Some("хорошо")));
+
+        // Exact readings win over the static AZERTY guess (Canadian/Swiss French are QWERTY-like).
+        let a = reading(&[(Lang::Ru, "привет")]);
+        let d = engine.evaluate_with_alts("ghbdtn", &a, Lang::Fr, "notepad.exe");
+        assert_eq!(d.replacement.as_deref(), Some("привет"), "{}", d.reason);
+
+        // A real French word typed in French is kept.
+        let a = reading(&[(Lang::Ru, "ищтощгк")]);
+        let d = engine.evaluate_with_alts("bonjour", &a, Lang::Fr, "notepad.exe");
+        assert_eq!(d.action, ActionType::None);
+    }
+
+    #[test]
     fn test_ru_fr_and_ru_tr_and_pair_toggles() {
         let mut engine = Engine::new(None);
 

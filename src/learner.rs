@@ -1,5 +1,5 @@
-// The sqlite persistence layer is compiled out on Windows.
-#![cfg_attr(target_os = "windows", allow(dead_code, unused_imports))]
+// Persistence uses the system SQLite: libsqlite3 on macOS / Linux, winsqlite3.dll (part of
+// Windows 10+) on Windows, linked without an import library.
 
 use crate::{Lang, PairId};
 use std::collections::{HashMap, VecDeque};
@@ -22,6 +22,7 @@ const SQLITE_ROW: c_int = 100;
 
 #[cfg_attr(target_os = "macos", link(name = "sqlite3"))]
 #[cfg_attr(target_os = "linux", link(name = "sqlite3"))]
+#[cfg_attr(target_os = "windows", link(name = "winsqlite3", kind = "raw-dylib"))]
 extern "C" {
     fn sqlite3_open(filename: *const c_char, pp_db: *mut *mut sqlite3) -> c_int;
     fn sqlite3_close(db: *mut sqlite3) -> c_int;
@@ -104,7 +105,6 @@ pub struct RecentFix {
 }
 
 pub struct LearningStore {
-    #[cfg(not(target_os = "windows"))]
     db: *mut sqlite3,
     pub rules: HashMap<String, LearnedRule>,
     pub word_frequency: HashMap<(String, Lang), u64>,
@@ -123,7 +123,6 @@ unsafe impl Send for LearningStore {}
 
 impl LearningStore {
     pub fn open(db_path: Option<&str>) -> Self {
-        #[cfg(not(target_os = "windows"))]
         let db = {
             let path_str = db_path.unwrap_or(":memory:");
             let c_path = CString::new(path_str).unwrap_or_else(|_| CString::new(":memory:").unwrap());
@@ -135,11 +134,8 @@ impl LearningStore {
             }
             ptr_db
         };
-        #[cfg(target_os = "windows")]
-        let _ = db_path;
 
         let mut store = Self {
-            #[cfg(not(target_os = "windows"))]
             db,
             rules: HashMap::new(),
             word_frequency: HashMap::new(),
@@ -159,7 +155,6 @@ impl LearningStore {
         store
     }
 
-    #[cfg(not(target_os = "windows"))]
     fn exec_sql(&self, sql: &str) {
         if self.db.is_null() {
             return;
@@ -170,9 +165,6 @@ impl LearningStore {
             }
         }
     }
-
-    #[cfg(target_os = "windows")]
-    fn exec_sql(&self, _sql: &str) {}
 
     fn init_schema(&self) {
         self.exec_sql(
@@ -198,7 +190,6 @@ impl LearningStore {
         );
     }
 
-    #[cfg(not(target_os = "windows"))]
     fn load_from_db(&mut self) {
         if self.db.is_null() {
             return;
@@ -294,8 +285,6 @@ impl LearningStore {
         }
     }
 
-    #[cfg(target_os = "windows")]
-    fn load_from_db(&mut self) {}
 
     fn persist_rule(&self, rule: &LearnedRule) {
         let escaped_word = sql_escape(&rule.word);
@@ -662,7 +651,6 @@ impl LearningStore {
     }
 }
 
-#[cfg(not(target_os = "windows"))]
 impl Drop for LearningStore {
     fn drop(&mut self) {
         if !self.db.is_null() {

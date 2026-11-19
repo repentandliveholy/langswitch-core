@@ -205,7 +205,7 @@ pub fn is_known_ru_word(word_lower: &str) -> bool {
 pub fn is_known_fr_word(word_lower: &str) -> bool {
     let set = FR_DICT.get_or_init(|| {
         let words = [
-            "bonjour", "salut", "merci", "bonsoir", "oui", "non", "comment", "allez", "vous",
+            "bonjour", "salut", "merci", "été", "école", "déjà", "voilà", "ça", "où", "là", "élève", "écrire", "écouter", "général", "idée", "fenêtre", "première", "prêt", "bientôt", "frère", "mère", "père", "tête", "fête", "côté", "réponse", "début", "numéro", "musée", "café", "bonsoir", "oui", "non", "comment", "allez", "vous",
             "nous", "je", "tu", "il", "elle", "ils", "elles", "est", "sont", "suis", "avoir",
             "etre", "être", "faire", "dire", "aller", "voir", "savoir", "pouvoir", "falloir",
             "vouloir", "venir", "prendre", "arriver", "croire", "mettre", "passer", "devoir",

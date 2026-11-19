@@ -35,6 +35,65 @@ struct EvalOpts {
     require_known: bool,
     /// Apply learning side effects (context, accepted-word stats) when nothing is converted.
     commit_none: bool,
+    /// The code/number guardrail was already cleared by an alternate layout reading
+    /// (e.g. `2е2` typed on Russian is `été` on French AZERTY).
+    skip_guard: bool,
+}
+
+/// The same physical keystrokes read through other keyboard layouts, by language.
+///
+/// Hosts that can translate keys through the real installed layouts (Windows `ToUnicodeEx`)
+/// pass one *exact* reading per target language; the engine then trusts those readings and
+/// skips its static keymap guesses. The legacy single `alt` string maps onto this as well.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AltReadings {
+    slots: [Option<String>; 4],
+    exact: bool,
+}
+
+impl AltReadings {
+    /// Readings that come straight from the installed layouts: static keymaps are skipped
+    /// for every language that has one.
+    pub fn exact() -> Self {
+        Self { slots: Default::default(), exact: true }
+    }
+
+    pub fn set(&mut self, lang: Lang, reading: impl Into<String>) {
+        let r = reading.into();
+        self.slots[lang as usize] = (!r.is_empty()).then_some(r);
+    }
+
+    pub fn get(&self, lang: Lang) -> Option<&str> {
+        self.slots[lang as usize].as_deref()
+    }
+
+    /// The legacy single alternate reading: the RU view for a Latin layout, the EN view for RU.
+    pub fn from_legacy(alt: Option<&str>, current: Lang) -> Self {
+        let mut a = Self::default();
+        if let Some(s) = alt {
+            a.set(if current == Lang::Ru { Lang::En } else { Lang::Ru }, s);
+        }
+        a
+    }
+
+    /// Characters `start..end` of each reading that is aligned with a `total`-char word.
+    fn slice(&self, total: usize, start: usize, end: usize) -> Self {
+        let mut out = Self { slots: Default::default(), exact: self.exact };
+        for (i, slot) in self.slots.iter().enumerate() {
+            if let Some(s) = slot {
+                let chars: Vec<char> = s.chars().collect();
+                if chars.len() == total {
+                    out.slots[i] = Some(chars[start..end].iter().collect());
+                }
+            }
+        }
+        out
+    }
+
+    /// The reading for `lang` unless it is identical to what was typed.
+    fn usable(&self, lang: Lang, typed: &str) -> Option<&str> {
+        self.get(lang).filter(|s| *s != typed)
+    }
 }
 
 pub struct Engine {
@@ -114,6 +173,18 @@ impl Engine {
         current_lang: Lang,
         app_bundle_id: &str,
     ) -> Decision {
+        let alts = AltReadings::from_legacy(alt_word_opt, current_lang);
+        self.evaluate_with_alts(active_word, &alts, current_lang, app_bundle_id)
+    }
+
+    /// Like [`Engine::evaluate`], with one reading of the keystrokes per target layout.
+    pub fn evaluate_with_alts(
+        &mut self,
+        active_word: &str,
+        alts: &AltReadings,
+        current_lang: Lang,
+        app_bundle_id: &str,
+    ) -> Decision {
         if !app_bundle_id.is_empty() && self.store.is_app_excluded(app_bundle_id) {
             return Decision::none("App excluded");
         }
@@ -123,9 +194,22 @@ impl Engine {
             return Decision::none("Empty word");
         }
 
+        // Digits and symbols usually mean code or numbers. But keys that are symbols in one
+        // layout can be letters in another (AZERTY `é` `è` `ç` `à` `'` sit on the Russian
+        // digit keys; Russian `х` is the French `^` dead key). Such a token is only converted
+        // into a real word, and only through an exact reading from the installed layout.
+        let mut skip_guard = false;
         if should_bypass_token(trimmed, current_lang) {
-            return Decision::none("Guardrail: code/number/URL/path");
+            if !self.alt_clears_guard(trimmed, alts, current_lang) {
+                return Decision::none("Guardrail: code/number/URL/path");
+            }
+            skip_guard = true;
         }
+        let opts = |require_known: bool, commit_none: bool| EvalOpts {
+            require_known: require_known || skip_guard,
+            commit_none,
+            skip_guard,
+        };
 
         // Split off leading/trailing characters that are not letters in the active layout.
         // On a QWERTY keyboard `,` `.` `;` `'` `[` `]` are Russian letters (б ю ж э х ъ), so a
@@ -141,10 +225,10 @@ impl Engine {
             _ => {
                 return self.evaluate_token(
                     trimmed,
-                    alt_word_opt,
+                    alts,
                     current_lang,
                     app_bundle_id,
-                    EvalOpts { require_known: true, commit_none: true },
+                    opts(true, true),
                 );
             }
         };
@@ -152,10 +236,10 @@ impl Engine {
         if start == 0 && end == chars.len() {
             return self.evaluate_token(
                 trimmed,
-                alt_word_opt,
+                alts,
                 current_lang,
                 app_bundle_id,
-                EvalOpts { require_known: false, commit_none: true },
+                opts(false, true),
             );
         }
 
@@ -163,10 +247,10 @@ impl Engine {
         //    but only when the result is a real word.
         let whole = self.evaluate_token(
             trimmed,
-            alt_word_opt,
+            alts,
             current_lang,
             app_bundle_id,
-            EvalOpts { require_known: true, commit_none: false },
+            opts(true, false),
         );
         if whole.action != ActionType::None {
             return whole;
@@ -177,16 +261,13 @@ impl Engine {
         if start > 0 && end < chars.len() {
             let head: String = chars[..end].iter().collect();
             let tail: String = chars[end..].iter().collect();
-            let alt_head: Option<String> = alt_word_opt.and_then(|alt| {
-                let alt_chars: Vec<char> = alt.chars().collect();
-                (alt_chars.len() == chars.len()).then(|| alt_chars[..end].iter().collect())
-            });
+            let alt_head = alts.slice(chars.len(), 0, end);
             let mut d = self.evaluate_token(
                 &head,
-                alt_head.as_deref(),
+                &alt_head,
                 current_lang,
                 app_bundle_id,
-                EvalOpts { require_known: true, commit_none: false },
+                opts(true, false),
             );
             if d.action != ActionType::None {
                 if let Some(rep) = d.replacement.take() {
@@ -200,17 +281,14 @@ impl Engine {
         let prefix: String = chars[..start].iter().collect();
         let core: String = chars[start..end].iter().collect();
         let suffix: String = chars[end..].iter().collect();
-        let alt_core: Option<String> = alt_word_opt.and_then(|alt| {
-            let alt_chars: Vec<char> = alt.chars().collect();
-            (alt_chars.len() == chars.len()).then(|| alt_chars[start..end].iter().collect())
-        });
+        let alt_core = alts.slice(chars.len(), start, end);
 
         let mut decision = self.evaluate_token(
             &core,
-            alt_core.as_deref(),
+            &alt_core,
             current_lang,
             app_bundle_id,
-            EvalOpts { require_known: false, commit_none: true },
+            opts(false, true),
         );
         if let Some(rep) = decision.replacement.take() {
             decision.replacement = Some(format!("{prefix}{rep}{suffix}"));
@@ -221,7 +299,7 @@ impl Engine {
     fn evaluate_token(
         &mut self,
         trimmed: &str,
-        alt_word_opt: Option<&str>,
+        alts: &AltReadings,
         current_lang: Lang,
         app_bundle_id: &str,
         opts: EvalOpts,
@@ -230,7 +308,7 @@ impl Engine {
         if char_len == 0 {
             return Decision::none("Empty word");
         }
-        if should_bypass_token(trimmed, current_lang) {
+        if !opts.skip_guard && should_bypass_token(trimmed, current_lang) {
             return Decision::none("Guardrail: code/number/URL/path");
         }
 
@@ -292,7 +370,7 @@ impl Engine {
         }
 
         if char_len == 1 {
-            return self.evaluate_single_char(trimmed, alt_word_opt, current_lang, app_bundle_id);
+            return self.evaluate_single_char(trimmed, alts, current_lang, app_bundle_id);
         }
 
         // If the word is already a known dictionary word or personal vocab word in the active layout, keep it!
@@ -309,7 +387,7 @@ impl Engine {
         let active_score = self.score_word_in_lang(&active_lower, current_lang, app_bundle_id);
 
         // Gather enabled candidate (target_lang, candidate_word) pairs
-        let candidates = self.build_candidates(trimmed, alt_word_opt, current_lang);
+        let candidates = self.build_candidates(trimmed, alts, current_lang);
         if candidates.is_empty() {
             return Decision::none("No enabled language pairs for current layout");
         }
@@ -428,7 +506,7 @@ impl Engine {
         } else {
             if self.typo_correction && !opts.require_known {
                 if let Some(fix) =
-                    self.try_fix_typo(trimmed, alt_word_opt, current_lang, app_bundle_id, active_score)
+                    self.try_fix_typo(trimmed, alts, current_lang, app_bundle_id, active_score)
                 {
                     return fix;
                 }
@@ -450,7 +528,7 @@ impl Engine {
     fn evaluate_single_char(
         &mut self,
         trimmed: &str,
-        alt_word_opt: Option<&str>,
+        alts: &AltReadings,
         current_lang: Lang,
         app_bundle_id: &str,
     ) -> Decision {
@@ -465,7 +543,7 @@ impl Engine {
             return none();
         }
         let Some((target_lang, cand)) = self
-            .build_candidates(trimmed, alt_word_opt, current_lang)
+            .build_candidates(trimmed, alts, current_lang)
             .into_iter()
             .find(|(l, w)| *l == prev && w.chars().count() == 1 && w != trimmed)
         else {
@@ -542,7 +620,7 @@ impl Engine {
     fn try_fix_typo(
         &mut self,
         trimmed: &str,
-        alt_word_opt: Option<&str>,
+        alts: &AltReadings,
         current_lang: Lang,
         app_bundle_id: &str,
         active_score: f64,
@@ -572,7 +650,7 @@ impl Engine {
                 .map(|a| a.caution_margin())
                 .unwrap_or(0.0);
             let mut best: Option<(Lang, String, f64, usize)> = None;
-            for (target_lang, cand) in self.build_candidates(trimmed, alt_word_opt, current_lang) {
+            for (target_lang, cand) in self.build_candidates(trimmed, alts, current_lang) {
                 let cand_lower = cand.to_lowercase();
                 let len = cand_lower.chars().count();
                 let max_edits = max_cross_layout_edits(len);
@@ -671,58 +749,57 @@ impl Engine {
     fn build_candidates(
         &self,
         trimmed: &str,
-        alt_word_opt: Option<&str>,
+        alts: &AltReadings,
         current_lang: Lang,
     ) -> Vec<(Lang, String)> {
         let mut out = Vec::with_capacity(5);
+        // An exact reading replaces the static keymap guesses for that language.
+        let push = |out: &mut Vec<(Lang, String)>, lang: Lang, statics: &[fn(&str) -> String]| {
+            if let Some(s) = alts.usable(lang, trimmed) {
+                out.push((lang, s.to_string()));
+                if alts.exact {
+                    return;
+                }
+            }
+            if alts.exact && alts.get(lang).is_some() {
+                return; // the exact reading equals the typed text: nothing to convert into
+            }
+            for f in statics {
+                out.push((lang, f(trimmed)));
+            }
+        };
 
         match current_lang {
             Lang::Ru => {
                 if self.pair_active(PairId::RuEn) {
-                    let w = match alt_word_opt {
-                        Some(s) if !s.is_empty() && s != trimmed => s.to_string(),
-                        _ => jcuken_to_qwerty(trimmed),
-                    };
-                    out.push((Lang::En, w));
+                    match alts.usable(Lang::En, trimmed) {
+                        Some(s) => out.push((Lang::En, s.to_string())),
+                        None => out.push((Lang::En, jcuken_to_qwerty(trimmed))),
+                    }
                 }
                 if self.pair_active(PairId::RuFr) {
-                    out.push((Lang::Fr, jcuken_to_azerty(trimmed)));
-                    out.push((Lang::Fr, jcuken_to_qwerty(trimmed)));
+                    push(&mut out, Lang::Fr, &[jcuken_to_azerty, jcuken_to_qwerty]);
                 }
                 if self.pair_active(PairId::RuTr) {
-                    out.push((Lang::Tr, jcuken_to_turkish_q(trimmed)));
-                    out.push((Lang::Tr, jcuken_to_qwerty(trimmed)));
+                    push(&mut out, Lang::Tr, &[jcuken_to_turkish_q, jcuken_to_qwerty]);
                 }
             }
             Lang::En => {
                 if self.pair_active(PairId::RuEn) {
-                    let w = match alt_word_opt {
-                        Some(s) if !s.is_empty() && s != trimmed => s.to_string(),
-                        _ => qwerty_to_jcuken(trimmed),
-                    };
-                    out.push((Lang::Ru, w));
+                    match alts.usable(Lang::Ru, trimmed) {
+                        Some(s) => out.push((Lang::Ru, s.to_string())),
+                        None => out.push((Lang::Ru, qwerty_to_jcuken(trimmed))),
+                    }
                 }
             }
             Lang::Fr => {
                 if self.pair_active(PairId::RuFr) {
-                    if let Some(s) = alt_word_opt {
-                        if !s.is_empty() && s != trimmed {
-                            out.push((Lang::Ru, s.to_string()));
-                        }
-                    }
-                    out.push((Lang::Ru, azerty_to_jcuken(trimmed)));
-                    out.push((Lang::Ru, qwerty_to_jcuken(trimmed)));
+                    push(&mut out, Lang::Ru, &[azerty_to_jcuken, qwerty_to_jcuken]);
                 }
             }
             Lang::Tr => {
                 if self.pair_active(PairId::RuTr) {
-                    if let Some(s) = alt_word_opt {
-                        if !s.is_empty() && s != trimmed {
-                            out.push((Lang::Ru, s.to_string()));
-                        }
-                    }
-                    out.push((Lang::Ru, turkish_q_to_jcuken(trimmed)));
-                    out.push((Lang::Ru, qwerty_to_jcuken(trimmed)));
+                    push(&mut out, Lang::Ru, &[turkish_q_to_jcuken, qwerty_to_jcuken]);
                 }
             }
         }
@@ -730,14 +807,48 @@ impl Engine {
         out
     }
 
+    /// An exact alternate reading turns a token that looks like code in the active layout
+    /// into a plain word (`2е2` -> `été`, `^jhjij` -> `хорошо`).
+    fn alt_clears_guard(&self, trimmed: &str, alts: &AltReadings, current_lang: Lang) -> bool {
+        if !alts.exact || !trimmed.chars().any(|c| c.is_alphabetic()) {
+            return false;
+        }
+        [Lang::En, Lang::Ru, Lang::Fr, Lang::Tr].into_iter().any(|lang| {
+            lang != current_lang
+                && self.is_transition_enabled(current_lang, lang)
+                && alts.usable(lang, trimmed).is_some_and(|alt| {
+                    alt.chars().filter(|c| c.is_alphabetic()).count() >= 2
+                        && !should_bypass_token(alt, lang)
+                })
+        })
+    }
+
     fn is_known_word(&self, word_lower: &str, lang: Lang) -> bool {
         let builtin = match lang {
             Lang::En => is_known_en_word(word_lower),
             Lang::Ru => is_known_ru_word(word_lower),
-            Lang::Fr => is_known_fr_word(word_lower),
+            Lang::Fr => is_known_fr_word(word_lower) || self.is_known_fr_elision(word_lower),
             Lang::Tr => is_known_tr_word(word_lower),
         };
         builtin || self.validator_accepts(word_lower, lang)
+    }
+
+    /// French elisions: `c'est`, `l'été`, `qu'il`, `aujourd'hui`.
+    fn is_known_fr_elision(&self, word_lower: &str) -> bool {
+        let Some((head, rest)) = word_lower.split_once(['\'', '’']) else {
+            return false;
+        };
+        if head == "aujourd" && rest == "hui" {
+            return true;
+        }
+        const HEADS: [&str; 14] = [
+            "l", "d", "j", "m", "n", "s", "t", "c", "qu", "jusqu", "lorsqu", "puisqu", "quoiqu",
+            "presqu",
+        ];
+        HEADS.contains(&head)
+            && rest.chars().count() >= 2
+            && rest.chars().all(|c| c.is_alphabetic())
+            && (is_known_fr_word(rest) || self.validator_accepts(rest, Lang::Fr))
     }
 
     /// Asks the host dictionary. Words shorter than 3 letters are never sent: system
