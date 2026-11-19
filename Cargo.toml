@@ -1,0 +1,15 @@
+[package]
+name = "langswitch-core"
+version = "0.3.0"
+edition = "2021"
+description = "Superfast self-educating keyboard layout detection and switching engine"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/repentandliveholy/langswitch-core"
+homepage = "https://langswitch.repentandliveholy.org"
+readme = "README.md"
+keywords = ["keyboard", "layout", "punto", "russian", "input"]
+categories = ["text-processing", "localization"]
+
+[lib]
+name = "langswitch_core"
+crate-type = ["staticlib", "rlib"]
