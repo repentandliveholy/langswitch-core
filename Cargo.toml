@@ -1,6 +1,6 @@
 [package]
 name = "langswitch-core"
-version = "0.3.4"
+version = "0.3.5"
 edition = "2021"
 description = "Superfast self-educating keyboard layout detection and switching engine"
 license = "MIT OR Apache-2.0"
