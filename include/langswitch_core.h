@@ -55,6 +55,17 @@ LSDecision ls_engine_evaluate(
     const char* app_bundle_id
 );
 
+// Evaluate a word still being typed (4+ letters). Only unambiguous layout conversions;
+// never spelling/caps fixes or vocabulary learning from fragments. Stop calling after a fix.
+// Ownership is the same as ls_engine_evaluate (free with ls_decision_free).
+LSDecision ls_engine_evaluate_prefix(
+    LSEngine* engine,
+    const char* active_word,
+    const char* alt_word,
+    int32_t current_lang,
+    const char* app_bundle_id
+);
+
 // Convert arbitrary text (single word or multi-word selection) to the best enabled opposite layout.
 char* ls_engine_convert_text(
     LSEngine* engine,

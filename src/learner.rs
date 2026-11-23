@@ -381,23 +381,25 @@ impl LearningStore {
         original_lang: Lang,
         app_bundle_id: &str,
     ) {
-        let key = original_word.to_lowercase();
+        let (orig_core, conv_core) = strip_matching_edge_punct(original_word, converted_word);
+        let key = orig_core.to_lowercase();
+        let target_key = conv_core.to_lowercase();
         if key.is_empty() {
             return;
         }
         self.total_undos += 1;
         self.persist_stat("undos", self.total_undos);
 
-        if let Some(front) = self.recent_fixes.front_mut() {
-            if front.from.eq_ignore_ascii_case(original_word) || front.to == converted_word {
-                front.undone = true;
+        for fix in &mut self.recent_fixes {
+            if fix.from.to_lowercase() == key || (!target_key.is_empty() && fix.to.to_lowercase() == target_key) {
+                fix.undone = true;
             }
         }
 
         let hits = self.rules.get(&key).map(|r| r.hits + 1).unwrap_or(1);
         let rule = LearnedRule {
             word: key.clone(),
-            target: converted_word.to_lowercase(),
+            target: target_key,
             kind: RuleKind::NeverConvert,
             lang: original_lang,
             hits,
@@ -426,7 +428,8 @@ impl LearningStore {
         target_lang: Lang,
         app_bundle_id: &str,
     ) {
-        let key = original_word.to_lowercase();
+        let (orig_core, conv_core) = strip_matching_edge_punct(original_word, converted_word);
+        let key = orig_core.to_lowercase();
         if key.is_empty() {
             return;
         }
@@ -435,7 +438,7 @@ impl LearningStore {
 
         // A new `x -> y` rule contradicts an older `y -> x` rule (e.g. `ш -> i` vs `i -> ш`):
         // the latest intent wins, otherwise the pair ping-pongs and breaks both words.
-        let inverse = converted_word.to_lowercase();
+        let inverse = conv_core.to_lowercase();
         if inverse != key
             && self
                 .rules
@@ -449,7 +452,7 @@ impl LearningStore {
         let hits = self.rules.get(&key).map(|r| r.hits + 1).unwrap_or(1);
         let rule = LearnedRule {
             word: key.clone(),
-            target: converted_word.to_lowercase(),
+            target: inverse,
             kind: RuleKind::AlwaysConvert,
             lang: target_lang,
             hits,
@@ -457,7 +460,7 @@ impl LearningStore {
         self.persist_rule(&rule);
         self.rules.insert(key, rule);
 
-        self.record_accepted(converted_word, target_lang, app_bundle_id);
+        self.record_accepted(&conv_core, target_lang, app_bundle_id);
     }
 
     pub fn record_accepted(&mut self, word: &str, lang: Lang, app_bundle_id: &str) {
@@ -540,6 +543,13 @@ impl LearningStore {
         let key = word.trim().to_lowercase();
         if key.is_empty() {
             return;
+        }
+        if kind == RuleKind::NeverConvert {
+            for fix in &mut self.recent_fixes {
+                if fix.from.to_lowercase() == key {
+                    fix.undone = true;
+                }
+            }
         }
         let rule = LearnedRule {
             word: key.clone(),
@@ -660,6 +670,41 @@ impl Drop for LearningStore {
             self.db = ptr::null_mut();
         }
     }
+}
+
+/// Strips leading/trailing non-alphabetic punctuation that was left unchanged in both words
+/// (e.g. `("ghbdtn,", "привет,")` -> `("ghbdtn", "привет")`), while keeping punctuation that
+/// actually converted into letters (e.g. `("[jhjij", "хорошо")`).
+fn strip_matching_edge_punct(a: &str, b: &str) -> (String, String) {
+    let mut ac: Vec<char> = a.chars().collect();
+    let mut bc: Vec<char> = b.chars().collect();
+    let mut start = 0;
+    while start < ac.len()
+        && start < bc.len()
+        && ac[start] == bc[start]
+        && !ac[start].is_alphabetic()
+    {
+        start += 1;
+    }
+    let mut a_end = ac.len();
+    let mut b_end = bc.len();
+    while a_end > start
+        && b_end > start
+        && ac[a_end - 1] == bc[b_end - 1]
+        && !ac[a_end - 1].is_alphabetic()
+    {
+        a_end -= 1;
+        b_end -= 1;
+    }
+    if start == a_end {
+        return (a.to_string(), b.to_string());
+    }
+    ac.truncate(a_end);
+    bc.truncate(b_end);
+    (
+        ac[start..].iter().collect(),
+        bc[start..].iter().collect(),
+    )
 }
 
 fn sql_escape(s: &str) -> String {

@@ -18,6 +18,11 @@ in a few microseconds. It handles **RU ↔ EN**, **RU ↔ FR** (AZERTY) and **RU
   numbers, `camelCase` and CLI flags are never touched; an optional host dictionary makes it convert only
   into real words.
 - **Typo correction** and **accidental cAPS lOCK** fixes (`hELLO` → `Hello`).
+- **Early layout detection** with `Engine::evaluate_prefix` / `evaluate_prefix_with_alts` (C:
+  `ls_engine_evaluate_prefix`). Compares dictionary prefixes after four letters; converts only
+  with one supported target and an implausible active-language reading. Honors enabled pairs,
+  entitlements, excluded/code apps and learned exceptions. Stop checking until the next word
+  boundary after a conversion. Fragments do not update vocabulary or app priors.
 - **Self-learning** (undo → *never convert*, manual conversion → *always convert*, personal vocabulary,
   per-app habits) persisted in SQLite (macOS/Linux; in-memory on Windows).
 - **Entitlements**: a host can lock individual features (`entitlements::Feature`); everything is unlocked

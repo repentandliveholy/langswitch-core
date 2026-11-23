@@ -4,7 +4,7 @@ use crate::keymap::{
 };
 use crate::learner::{LearningStore, RuleKind};
 use crate::lexicon::{
-    is_known_en_word, is_known_fr_word, is_known_ru_word, is_known_tr_word,
+    is_known_en_word, is_known_fr_word, is_known_ru_word, is_known_tr_word, is_known_prefix,
     score_en_phonotactics, score_fr_phonotactics, score_ru_phonotactics, score_tr_phonotactics,
 };
 use crate::typo::{
@@ -177,6 +177,97 @@ impl Engine {
         self.evaluate_with_alts(active_word, &alts, current_lang, app_bundle_id)
     }
 
+    /// Evaluate an unfinished word. Unlike boundary evaluation, this only changes layouts:
+    /// no spelling/caps fixes, app priors or vocabulary learning from fragments.
+    pub fn evaluate_prefix(
+        &mut self,
+        active_word: &str,
+        alt_word: Option<&str>,
+        current_lang: Lang,
+        app_bundle_id: &str,
+    ) -> Decision {
+        let alts = AltReadings::from_legacy(alt_word, current_lang);
+        self.evaluate_prefix_with_alts(active_word, &alts, current_lang, app_bundle_id)
+    }
+
+    pub fn evaluate_prefix_with_alts(
+        &mut self,
+        active_word: &str,
+        alts: &AltReadings,
+        current_lang: Lang,
+        app_bundle_id: &str,
+    ) -> Decision {
+        let len = active_word.chars().count();
+        if !(4..=48).contains(&len)
+            || self.store.is_app_excluded(app_bundle_id)
+            || is_code_app(app_bundle_id)
+            || should_bypass_token(active_word, current_lang)
+            || detect_inverted_caps(active_word).is_some()
+            || !active_word.chars().all(|c| c.is_alphabetic())
+        {
+            return Decision::none("Prefix guardrail");
+        }
+
+        let lower = active_word.to_lowercase();
+        // A learned exception for a whole word must also protect its first letters. An
+        // exception learned by undoing a prefix (always 4+ chars) protects continuations
+        // of that prefix, without letting a short 1-3 letter rule block unrelated words.
+        if self.store.rules.values().any(|r| {
+            (r.kind == RuleKind::NeverConvert
+                && (r.word.starts_with(&lower)
+                    || (r.word.chars().count() >= 4 && lower.starts_with(&r.word))))
+                || (r.kind == RuleKind::PersonalVocab && r.lang == current_lang
+                    && r.word.starts_with(&lower))
+        }) || is_known_prefix(&lower, current_lang)
+            || self.is_known_or_personal(&lower, current_lang)
+        {
+            return Decision::none("Plausible prefix in active layout or learned exception");
+        }
+
+        // Absence from our small dictionary alone is not evidence of a wrong layout.
+        let active_score = self.score_phonotactics(&lower, current_lang);
+        if active_score > 0.0 {
+            return Decision::none("Prefix still plausible in active layout");
+        }
+
+        let mut matches = Vec::new();
+        for (lang, candidate) in self.build_candidates(active_word, alts, current_lang) {
+            let candidate_lower = candidate.to_lowercase();
+            if candidate == active_word
+                || (alts.exact && alts.get(lang) != Some(candidate.as_str()))
+                || candidate.chars().count() != len
+                || !candidate.chars().all(|c| c.is_alphabetic())
+                || !(is_known_prefix(&candidate_lower, lang)
+                    || self.is_known_or_personal(&candidate_lower, lang)
+                    || self.store.rules.values().any(|r| r.kind == RuleKind::PersonalVocab
+                        && r.lang == lang && r.word.starts_with(&candidate_lower)))
+            {
+                continue;
+            }
+            if !matches.contains(&(lang, candidate.clone())) {
+                matches.push((lang, candidate));
+            }
+        }
+        // Multiple languages or alternate keymaps remain ambiguous, even when one scores higher.
+        if matches.len() != 1 {
+            return Decision::none("No unique target prefix");
+        }
+        let (target_lang, replacement) = matches.pop().unwrap();
+        let target_score = self.score_phonotactics(&replacement.to_lowercase(), target_lang);
+        if target_score < 0.0 || target_score - active_score < 3.0 {
+            return Decision::none("Below early conversion margin");
+        }
+        self.store.record_auto_conversion(active_word, &replacement, target_lang, app_bundle_id);
+        self.last_lang = Some(target_lang);
+        Decision {
+            action: ActionType::ConvertLayout,
+            target_lang,
+            replacement: Some(replacement),
+            confidence: 0.97,
+            reason: "Unique dictionary prefix with implausible active-layout reading".to_string(),
+        }
+    }
+
     /// Like [`Engine::evaluate`], with one reading of the keystrokes per target layout.
     pub fn evaluate_with_alts(
         &mut self,
@@ -192,6 +283,15 @@ impl Engine {
         let trimmed = active_word.trim_matches(|c: char| c.is_whitespace());
         if trimmed.is_empty() {
             return Decision::none("Empty word");
+        }
+
+        // A whole-token NeverConvert rule (e.g. `,eltn` or `[jhjij`) must stop evaluation
+        // before edge-punctuation stripping can fall through to a shorter core token.
+        if let Some(rule) = self.store.rules.get(&trimmed.to_lowercase()) {
+            if rule.kind == RuleKind::NeverConvert {
+                self.last_lang = Some(current_lang);
+                return Decision::none("Self-educated: never_convert rule");
+            }
         }
 
         // Digits and symbols usually mean code or numbers. But keys that are symbols in one
@@ -370,7 +470,7 @@ impl Engine {
         }
 
         if char_len == 1 {
-            return self.evaluate_single_char(trimmed, alts, current_lang, app_bundle_id);
+            return self.evaluate_single_char(trimmed, alts, current_lang, app_bundle_id, opts);
         }
 
         // If the word is already a known dictionary word or personal vocab word in the active layout, keep it!
@@ -469,8 +569,11 @@ impl Engine {
 
         if let Some((target_lang, best_word, best_score, best_known)) = best_target {
             let diff = best_score - active_score;
-            let final_replacement =
-                detect_inverted_caps(&best_word).unwrap_or(best_word);
+            let final_replacement = if self.entitlements.allows(Feature::CapsLockFix) {
+                detect_inverted_caps(&best_word).unwrap_or(best_word)
+            } else {
+                best_word
+            };
 
             let confidence = (0.5 + (diff / 12.0)).clamp(0.55, 0.99);
             let reason = if best_known {
@@ -522,45 +625,83 @@ impl Engine {
         }
     }
 
-    /// One-letter words (`e` -> `у`, `Ш` -> `I`) carry no evidence of their own, so they are
-    /// converted only when the previous word was in the target language and the letter is
-    /// a real word there while meaning nothing in the active layout.
+    /// One-letter words (`z` -> `я`, `b` -> `и`, `Ш` -> `I`, `ф` -> `a`) are converted when
+    /// the letter is not a valid word in the active layout and maps to a known single-letter
+    /// word in an enabled target layout. In code editors/terminals, Latin single letters still
+    /// require target-language context so variable names (`z`, `c`, `d`) are not touched.
     fn evaluate_single_char(
         &mut self,
         trimmed: &str,
         alts: &AltReadings,
         current_lang: Lang,
         app_bundle_id: &str,
+        opts: EvalOpts,
     ) -> Decision {
         let active_lower = trimmed.to_lowercase();
         let context = self.last_lang;
-        let none = || Decision::none("Single character (requires context or explicit rule)");
 
-        let Some(prev) = context.filter(|&l| l != current_lang) else {
-            return none();
-        };
-        if !trimmed.chars().all(|c| c.is_alphabetic()) || self.is_known_word(&active_lower, current_lang) {
-            return none();
+        if !trimmed.chars().all(|c| c.is_alphabetic()) {
+            return Decision::none("Single non-letter character");
         }
-        let Some((target_lang, cand)) = self
-            .build_candidates(trimmed, alts, current_lang)
-            .into_iter()
-            .find(|(l, w)| *l == prev && w.chars().count() == 1 && w != trimmed)
-        else {
-            return none();
-        };
-        if !self.is_known_word(&cand.to_lowercase(), target_lang) {
-            return none();
+        if self.is_known_or_personal(&active_lower, current_lang) {
+            if opts.commit_none {
+                self.last_lang = Some(current_lang);
+                self.store.record_app_word(current_lang, app_bundle_id);
+            }
+            return Decision::none("Valid single-letter word in active layout");
         }
 
+        let mut matches: Vec<(Lang, String)> = Vec::new();
+        for (target_lang, cand) in self.build_candidates(trimmed, alts, current_lang) {
+            if cand.chars().count() != 1 || cand == trimmed {
+                continue;
+            }
+            if !self.is_known_or_personal(&cand.to_lowercase(), target_lang) {
+                continue;
+            }
+            if is_code_app(app_bundle_id)
+                && current_lang != Lang::Ru
+                && context != Some(target_lang)
+            {
+                continue;
+            }
+            if !matches.iter().any(|(l, w)| *l == target_lang && *w == cand) {
+                matches.push((target_lang, cand));
+            }
+        }
+
+        let chosen = if let Some(prev) = context.filter(|&l| l != current_lang) {
+            matches
+                .iter()
+                .find(|(l, _)| *l == prev)
+                .cloned()
+                .or_else(|| (matches.len() == 1).then(|| matches[0].clone()))
+        } else if matches.len() == 1 {
+            Some(matches[0].clone())
+        } else {
+            matches
+                .into_iter()
+                .max_by(|(la, wa), (lb, wb)| {
+                    let sa = self.score_word_in_lang(&wa.to_lowercase(), *la, app_bundle_id);
+                    let sb = self.score_word_in_lang(&wb.to_lowercase(), *lb, app_bundle_id);
+                    sa.total_cmp(&sb)
+                })
+        };
+
+        let Some((target_lang, cand)) = chosen else {
+            return Decision::none("Single character with no valid target-language word");
+        };
+
+        self.last_lang = Some(target_lang);
         self.store
             .record_auto_conversion(trimmed, &cand, target_lang, app_bundle_id);
+        self.store.record_app_word(target_lang, app_bundle_id);
         Decision {
             action: ActionType::ConvertLayout,
             target_lang,
             replacement: Some(cand.clone()),
-            confidence: 0.8,
-            reason: format!("Single-letter word '{}' ({:?}) after {:?} context", cand, target_lang, prev),
+            confidence: 0.85,
+            reason: format!("Single-letter word '{}' ({:?})", cand, target_lang),
         }
     }
 

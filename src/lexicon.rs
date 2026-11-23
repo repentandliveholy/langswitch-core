@@ -530,7 +530,7 @@ pub fn score_fr_phonotactics(word_lower: &str) -> f64 {
     let common_fr_bigrams = [
         "es", "en", "le", "de", "re", "nt", "on", "er", "te", "el", "an", "se", "et", "la",
         "ai", "it", "me", "ou", "em", "ie", "ur", "us", "qu", "au", "is", "ne", "ar", "ti",
-        "ce", "in", "ns", "ur", "co", "tr", "ch", "eu", "oi", "gn", "il", "ll", "ss", "mm",
+        "ce", "in", "ns", "co", "tr", "ch", "eu", "oi", "gn", "il", "ll", "ss", "mm",
     ];
     for win in chars.windows(2) {
         let mut buf = String::with_capacity(4);
@@ -576,10 +576,10 @@ pub fn score_tr_phonotactics(word_lower: &str) -> f64 {
     }
 
     let common_tr_bigrams = [
-        "ar", "er", "an", "en", "in", "ın", "un", "ün", "ла", "le", "la", "de", "da", "te",
-        "ta", "ме", "ma", "me", "ка", "ka", "ke", "ли", "li", "lı", "lu", "lü", "ал", "el",
-        "ир", "ir", "ır", "ur", "ür", "ор", "or", "йо", "yo", "ша", "şe", "şı", "şi", "га",
-        "ğe", "ğı", "ği", "ча", "çe", "çı", "çi", "де", "di", "dı", "du", "dü",
+        "ar", "er", "an", "en", "in", "ın", "un", "ün", "al", "ol", "le", "la", "de", "da", "te",
+        "ta", "ma", "me", "ka", "ke", "li", "lı", "lu", "lü", "el", "ir", "ır", "ur", "ür", "or",
+        "ya", "yo", "şa", "şe", "şı", "şi", "ğa", "ğe", "ğı", "ği", "ça", "çe", "çı", "çi", "di",
+        "dı", "du", "dü",
     ];
     for win in chars.windows(2) {
         let mut buf = String::with_capacity(4);
@@ -668,7 +668,7 @@ pub fn score_ru_phonotactics(word_lower: &str) -> f64 {
         "ли", "та", "ос", "ом", "не", "ер", "ор", "ет", "ва", "де", "ка", "ть", "ел",
         "ан", "ве", "ин", "ал", "ат", "ри", "ле", "го", "ск", "ам", "ас", "ог", "ак", "ся",
         "ит", "ля", "ви", "ти", "ем", "ме", "да", "за", "ди", "се", "ла", "ма", "ми", "мо",
-        "му", "мы", "па", "пе", "пи", "при", "про", "ру", "са", "си", "со", "су",
+        "му", "мы", "па", "пе", "пи", "ру", "са", "си", "со", "су",
         "те", "ту", "ты", "хо", "че", "чт", "эт",
     ];
     for win in chars.windows(2) {
@@ -704,4 +704,23 @@ pub fn lexicon(lang: crate::Lang) -> &'static HashSet<&'static str> {
             TR_DICT.get().expect("initialised")
         }
     }
+}
+
+/// Prefixes are indexed once, so checking each keystroke never scans the dictionaries.
+pub fn is_known_prefix(prefix: &str, lang: crate::Lang) -> bool {
+    static PREFIXES: OnceLock<[HashSet<String>; 4]> = OnceLock::new();
+    let sets = PREFIXES.get_or_init(|| {
+        [crate::Lang::En, crate::Lang::Ru, crate::Lang::Fr, crate::Lang::Tr].map(|lang| {
+            let mut prefixes = HashSet::new();
+            for word in lexicon(lang) {
+                for (n, (i, c)) in word.char_indices().enumerate() {
+                    if (3..48).contains(&n) {
+                        prefixes.insert(word[..i + c.len_utf8()].to_string());
+                    }
+                }
+            }
+            prefixes
+        })
+    });
+    sets[lang as usize].contains(prefix)
 }

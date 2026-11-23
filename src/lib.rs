@@ -146,6 +146,28 @@ pub extern "C" fn ls_engine_evaluate(
     current_lang: i32,
     app_bundle_id: *const c_char,
 ) -> LSDecision {
+    evaluate_ffi(engine, active_word, alt_word, current_lang, app_bundle_id, false)
+}
+
+#[no_mangle]
+pub extern "C" fn ls_engine_evaluate_prefix(
+    engine: *mut Engine,
+    active_word: *const c_char,
+    alt_word: *const c_char,
+    current_lang: i32,
+    app_bundle_id: *const c_char,
+) -> LSDecision {
+    evaluate_ffi(engine, active_word, alt_word, current_lang, app_bundle_id, true)
+}
+
+fn evaluate_ffi(
+    engine: *mut Engine,
+    active_word: *const c_char,
+    alt_word: *const c_char,
+    current_lang: i32,
+    app_bundle_id: *const c_char,
+    prefix: bool,
+) -> LSDecision {
     if engine.is_null() {
         return LSDecision {
             action: ActionType::None as i32,
@@ -163,7 +185,11 @@ pub extern "C" fn ls_engine_evaluate(
     let app = cstr_to_str(app_bundle_id);
     let lang = Lang::from_i32(current_lang);
 
-    let dec = eng.evaluate(active, alt_opt, lang, app);
+    let dec = if prefix {
+        eng.evaluate_prefix(active, alt_opt, lang, app)
+    } else {
+        eng.evaluate(active, alt_opt, lang, app)
+    };
     LSDecision {
         action: dec.action as i32,
         target_lang: dec.target_lang as i32,
@@ -742,15 +768,70 @@ mod tests {
             assert_eq!(dec.replacement.as_deref(), Some(expected), "'{}' -> {:?}", typed, dec);
         }
 
-        // Single-letter words follow the previous word's language, never stand alone.
+        // Single-letter words convert even without prior context in normal apps (`z` -> `я`, `Ш` -> `I`),
+        // while valid active-layout single letters (`a`, `I`, `я`) and non-words (`g`, `x`) stay untouched.
         engine.reset_context();
-        assert_eq!(engine.evaluate("e", None, Lang::En, "x").action, ActionType::None);
-        engine.evaluate("ns", None, Lang::En, "x"); // -> ты
-        assert_eq!(engine.evaluate("e", None, Lang::En, "x").replacement.as_deref(), Some("у"));
-        engine.evaluate("рщц", None, Lang::Ru, "x"); // -> how
-        assert_eq!(engine.evaluate("Ш", None, Lang::Ru, "x").replacement.as_deref(), Some("I"));
-        engine.evaluate("hello", None, Lang::En, "x");
-        assert_eq!(engine.evaluate("a", None, Lang::En, "x").action, ActionType::None);
+        for (typed, lang, expected, target) in [
+            ("z", Lang::En, "я", Lang::Ru),
+            ("Z", Lang::En, "Я", Lang::Ru),
+            ("e", Lang::En, "у", Lang::Ru),
+            ("b", Lang::En, "и", Lang::Ru),
+            ("d", Lang::En, "в", Lang::Ru),
+            ("c", Lang::En, "с", Lang::Ru),
+            ("f", Lang::En, "а", Lang::Ru),
+            ("r", Lang::En, "к", Lang::Ru),
+            ("j", Lang::En, "о", Lang::Ru),
+            ("z,", Lang::En, "я,", Lang::Ru),
+            ("Ш", Lang::Ru, "I", Lang::En),
+            ("ш", Lang::Ru, "i", Lang::En),
+            ("ф", Lang::Ru, "a", Lang::En),
+        ] {
+            engine.reset_context();
+            let dec = engine.evaluate(typed, None, lang, "com.apple.Notes");
+            assert_eq!(dec.action, ActionType::ConvertLayout, "'{}' -> {:?}", typed, dec);
+            assert_eq!(dec.target_lang, target, "'{}'", typed);
+            assert_eq!(dec.replacement.as_deref(), Some(expected), "'{}' -> {:?}", typed, dec);
+        }
+        for (typed, lang) in [
+            ("a", Lang::En),
+            ("I", Lang::En),
+            ("g", Lang::En),
+            ("x", Lang::En),
+            ("я", Lang::Ru),
+            ("в", Lang::Ru),
+            ("й", Lang::Ru),
+        ] {
+            engine.reset_context();
+            assert_eq!(
+                engine.evaluate(typed, None, lang, "com.apple.Notes").action,
+                ActionType::None,
+                "'{}' should not convert",
+                typed
+            );
+        }
+        // In code apps / terminals, single Latin letters stay untouched without Russian context.
+        engine.reset_context();
+        assert_eq!(engine.evaluate("z", None, Lang::En, "com.apple.Terminal").action, ActionType::None);
+        assert_eq!(engine.evaluate("c", None, Lang::En, "com.microsoft.VSCode").action, ActionType::None);
+
+        // Undo on a punctuated word normalizes the rule to the core word and marks recent_fixes undone.
+        engine.reset_context();
+        let dec = engine.evaluate("ghbdtn,", None, Lang::En, "com.apple.Notes");
+        assert_eq!(dec.replacement.as_deref(), Some("привет,"));
+        engine.store.record_undo("ghbdtn,", "привет,", Lang::En, "com.apple.Notes");
+        assert!(engine.store.recent_fixes.front().unwrap().undone);
+        assert_eq!(engine.evaluate("ghbdtn", None, Lang::En, "com.apple.Notes").action, ActionType::None);
+
+        // Whole-token NeverConvert with leading/trailing punctuation must not fall through to core.
+        engine.store.add_rule(",eltn", ",eltn", RuleKind::NeverConvert, Lang::En);
+        assert_eq!(engine.evaluate(",eltn", None, Lang::En, "com.apple.Notes").action, ActionType::None);
+
+        // add_rule(NeverConvert) marks matching recent fixes as undone.
+        engine.reset_context();
+        let _ = engine.evaluate("rfr", None, Lang::En, "com.apple.Notes");
+        assert!(!engine.store.recent_fixes.front().unwrap().undone);
+        engine.store.add_rule("rfr", "rfr", RuleKind::NeverConvert, Lang::En);
+        assert!(engine.store.recent_fixes.front().unwrap().undone);
 
         // Contradicting learned rules: the newest wins, and a weak rule never
         // turns a real word (`I`) into a non-word (`Ш`).
