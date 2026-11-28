@@ -9,7 +9,8 @@ use crate::lexicon::{
 };
 use crate::typo::{
     builtin_suggestions, edit_distance, edit_kind, is_adjacent_swap, is_code_app,
-    max_cross_layout_edits, EditKind, MIN_SAME_LAYOUT_LEN, MIN_UNBACKED_EDIT_LEN,
+    max_cross_layout_edits, EditKind, MAX_NON_SWAP_ALTERNATIVES, MIN_SAME_LAYOUT_LEN,
+    MIN_UNBACKED_EDIT_LEN,
 };
 use crate::entitlements::{Entitlements, Feature};
 use crate::{ActionType, Decision, Lang, PairId};
@@ -425,10 +426,19 @@ impl Engine {
                     // A rule learned once or twice (often by accident: a stray ⌘ tap, or
                     // delete-and-retype) must not override a real word in the active
                     // layout, e.g. English `I` -> `Ш`.
-                    let overrides_real_word = rule.hits < 3
+                    let weak = rule.hits < 3;
+                    let overrides_real_word = weak
                         && self.is_known_word(&active_lower, current_lang)
                         && !self.is_known_word(&rule.target, rule.lang);
-                    if !overrides_real_word && self.is_transition_enabled(current_lang, rule.lang) {
+                    // A weak one-letter rule into a non-word (`н` -> `y`, learned from a single
+                    // delete-and-retype) would fire on every stray keypress of that letter.
+                    let stray_letter = weak
+                        && char_len == 1
+                        && !self.is_known_or_personal(&rule.target, rule.lang);
+                    if !overrides_real_word
+                        && !stray_letter
+                        && self.is_transition_enabled(current_lang, rule.lang)
+                    {
                         let replacement = apply_casing_pattern(trimmed, &rule.target);
                         let target_lang = rule.lang;
                         self.last_lang = Some(target_lang);
@@ -855,7 +865,15 @@ impl Engine {
         } else {
             return None;
         };
-        let min_len = match edit_kind(&active_lower, &fixed) {
+        let kind = edit_kind(&active_lower, &fixed);
+        // A swap is a clear signal, but a wrong / missing / extra letter with many one-edit
+        // words around it is a guess even when the system picks one: `gole` is as likely
+        // `golf`, `gold` or `hole` as the system's `gone`; `истинну` is `истинную` as
+        // often as `истину`.
+        if kind != EditKind::Swap && same_layout.len() > MAX_NON_SWAP_ALTERNATIVES {
+            return None;
+        }
+        let min_len = match kind {
             EditKind::Swap => MIN_SAME_LAYOUT_LEN,
             // Without the system's backing, a single guess is weak evidence.
             _ if !backed => MIN_UNBACKED_EDIT_LEN,

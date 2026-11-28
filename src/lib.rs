@@ -726,6 +726,22 @@ mod tests {
         let dec3 = engine.evaluate("b", None, Lang::En, "com.apple.Notes");
         assert_eq!(dec3.action, ActionType::ConvertLayout);
         assert_eq!(dec3.replacement.as_deref(), Some("и"));
+
+        // A one-letter rule into a non-word, learned once by delete-and-retype, stays inert
+        // until confirmed repeatedly.
+        engine
+            .store
+            .record_manual_convert("н", "y", Lang::En, "com.apple.Notes");
+        engine.reset_context();
+        assert_eq!(engine.evaluate("н", None, Lang::Ru, "com.apple.Notes").action, ActionType::None);
+        for _ in 0..2 {
+            engine.store.record_manual_convert("н", "y", Lang::En, "com.apple.Notes");
+        }
+        engine.reset_context();
+        assert_eq!(
+            engine.evaluate("н", None, Lang::Ru, "com.apple.Notes").replacement.as_deref(),
+            Some("y")
+        );
     }
 
     #[test]
@@ -848,6 +864,7 @@ mod tests {
             (lang, w),
             (1, "чувствует") | (0, "receive") | (0, "relieve") | (0, "found") | (0, "pound") | (0, "nasty")
                 | (0, "long") | (0, "loan") | (0, "ppm") | (1, "дела") | (1, "сила") | (1, "ничто")
+                | (0, "gone") | (0, "golf") | (0, "gold") | (1, "истину") | (1, "истинную") | (1, "закрыт")
         )
     }
 
@@ -863,6 +880,9 @@ mod tests {
             (0, "logn") => "!long\nlong\nloan",
             (0, "pnpm") => "!ppm\nppm",
             (1, "дила") => "!дела\nдела\nсила",
+            (0, "gole") => "!gone\nhole\ngold\ntole\nogle\nbole\nvole\ngolf\ngone\ngore\ngale\ndole\npole\nrole\nsole",
+            (1, "истинну") => "!истину\nистину\nистинно\nистинную\nистинна\nистинны",
+            (1, "зыкрыт") => "!закрыт\nзакрыт",
             (1, "ничо") => "!ничто\nничто",
             _ => "",
         };
@@ -918,8 +938,12 @@ mod tests {
             let d = engine.evaluate(word, None, lang, app);
             assert_eq!((d.action, d.replacement.as_deref()), (ActionType::FixTypo, Some(fixed)), "{word}: {d:?}");
         }
-        // ...but never drop a typed letter in short words, or add one to 4-letter slang.
-        for (word, lang) in [("pnpm", Lang::En), ("ничо", Lang::Ru)] {
+        engine.reset_context();
+        let d = engine.evaluate("зыкрыт", None, Lang::Ru, app);
+        assert_eq!(d.replacement.as_deref(), Some("закрыт"), "{d:?}");
+        // ...but never drop a typed letter in short words, or add one to 4-letter slang,
+        // and never guess among many equally close words, even with the system's pick.
+        for (word, lang) in [("pnpm", Lang::En), ("ничо", Lang::Ru), ("gole", Lang::En), ("истинну", Lang::Ru)] {
             engine.reset_context();
             assert_eq!(engine.evaluate(word, None, lang, app).action, ActionType::None, "{word}");
         }

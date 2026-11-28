@@ -52,6 +52,10 @@ pub const MIN_SAME_LAYOUT_LEN: usize = 4;
 /// non-swap fix the system spell checker did not itself choose.
 pub const MIN_UNBACKED_EDIT_LEN: usize = 7;
 
+/// Most one-edit spellings a non-swap fix may compete with (the fix included): with more,
+/// the system's pick is a coin toss (`gole` -> gone / golf / gold / hole / pole...).
+pub const MAX_NON_SWAP_ALTERNATIVES: usize = 2;
+
 /// What a one-edit fix changes in the typed word.
 #[derive(Debug, PartialEq, Eq)]
 pub enum EditKind {
